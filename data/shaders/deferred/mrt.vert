@@ -4,24 +4,9 @@
 #extension GL_ARB_shading_language_420pack : enable
 
 layout (location = 0) in vec4 inPos;
-layout (location = 1) in vec2 inUV;
-layout (location = 2) in vec3 inColor;
-layout (location = 3) in vec3 inNormal;
-layout (location = 4) in vec3 inTangent;
+layout (location = 1) in vec3 inColor;
 
-layout (binding = 0) uniform UBO 
-{
-	mat4 projection;
-	mat4 model;
-	mat4 view;
-	vec4 instancePos[3];
-} ubo;
-
-layout (location = 0) out vec3 outNormal;
-layout (location = 1) out vec2 outUV;
-layout (location = 2) out vec3 outColor;
-layout (location = 3) out vec3 outWorldPos;
-layout (location = 4) out vec3 outTangent;
+layout (location = 0) out vec3 outColor;
 
 out gl_PerVertex
 {
@@ -30,23 +15,23 @@ out gl_PerVertex
 
 void main() 
 {
-	vec4 tmpPos = inPos + ubo.instancePos[gl_InstanceIndex];
+//	vec4 tmpPos = inPos + ubo.instancePos[0];
 
-	gl_Position = ubo.projection * ubo.view * ubo.model * tmpPos;
-	
-	outUV = inUV;
-	outUV.t = 1.0 - outUV.t;
+	gl_Position = inPos;//ubo.projection * ubo.view * ubo.model * tmpPos;
+	outColor = inColor;
+//	outUV = inUV;
+//	outUV.t = 1.0 - outUV.t;
 
 	// Vertex position in world space
-	outWorldPos = vec3(ubo.model * tmpPos);
+//	outWorldPos = vec3(ubo.model * tmpPos);
 	// GL to Vulkan coord space
-	outWorldPos.y = -outWorldPos.y;
+//	outWorldPos.y = -outWorldPos.y;
 	
 	// Normal in world space
-	mat3 mNormal = transpose(inverse(mat3(ubo.model)));
-	outNormal = mNormal * normalize(inNormal);	
-	outTangent = mNormal * normalize(inTangent);
+//	mat3 mNormal = transpose(inverse(mat3(ubo.model)));
+//	outNormal = mNormal * normalize(inNormal);	
+//	outTangent = mNormal * normalize(inTangent);
 	
 	// Currently just vertex color
-	outColor = inColor;
+	outColor = vec3(1.0, 1.0, 0.0);//inColor;
 }

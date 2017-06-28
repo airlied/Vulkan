@@ -33,6 +33,7 @@
 // Offscreen frame buffer properties
 #define FB_DIM TEX_DIM
 
+#define NUM_MRT 1
 class VulkanExample : public VulkanExampleBase
 {
 public:
@@ -136,10 +137,18 @@ public:
 	// Semaphore used to synchronize between offscreen and final scene rendering
 	VkSemaphore offscreenSemaphore = VK_NULL_HANDLE;
 
+        // Pipeline statistics
+        struct {
+                VkBuffer buffer;
+                VkDeviceMemory memory;
+        } queryResult;
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        uint64_t pipelineStats[2] = { 0 };
+
 	VulkanExample() : VulkanExampleBase(ENABLE_VALIDATION)
 	{
 		title = "Vulkan Example - Deferred shading (2016 by Sascha Willems)";
-		enableTextOverlay = true;
+		enableTextOverlay = false;
 		camera.type = Camera::CameraType::firstperson;
 		camera.movementSpeed = 5.0f;
 #ifndef __ANDROID__
@@ -208,7 +217,62 @@ public:
 		textures.floor.normalMap.destroy();
 
 		vkDestroySemaphore(device, offscreenSemaphore, nullptr);
+
+		if (queryPool != VK_NULL_HANDLE) {
+			vkDestroyQueryPool(device, queryPool, nullptr);
+			vkDestroyBuffer(device, queryResult.buffer, nullptr);
+			vkFreeMemory(device, queryResult.memory, nullptr);
+                }
+
 	}
+
+          // Setup pool and buffer for storing pipeline statistics results
+        void setupQueryResultBuffer()
+        {
+                uint32_t bufSize = 2 * sizeof(uint64_t);
+
+                VkMemoryRequirements memReqs;
+                VkMemoryAllocateInfo memAlloc = vks::initializers::memoryAllocateInfo();
+                VkBufferCreateInfo bufferCreateInfo =
+                        vks::initializers::bufferCreateInfo(
+                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                bufSize);
+
+                // Results are saved in a host visible buffer for easy access by the application
+                VK_CHECK_RESULT(vkCreateBuffer(device, &bufferCreateInfo, nullptr, &queryResult.buffer));
+                vkGetBufferMemoryRequirements(device, queryResult.buffer, &memReqs);
+                memAlloc.allocationSize = memReqs.size;
+                memAlloc.memoryTypeIndex = vulkanDevice->getMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                VK_CHECK_RESULT(vkAllocateMemory(device, &memAlloc, nullptr, &queryResult.memory));
+                VK_CHECK_RESULT(vkBindBufferMemory(device, queryResult.buffer, queryResult.memory, 0));
+
+                // Create query pool
+                if (deviceFeatures.pipelineStatisticsQuery) {
+                        VkQueryPoolCreateInfo queryPoolInfo = {};
+                        queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+                        queryPoolInfo.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                        queryPoolInfo.pipelineStatistics =
+                                VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+                                VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+                        queryPoolInfo.queryCount = 2;
+                        VK_CHECK_RESULT(vkCreateQueryPool(device, &queryPoolInfo, NULL, &queryPool));
+                }
+        }
+
+        // Retrieves the results of the pipeline statistics query submitted to the command buffer
+        void getQueryResults()
+        {
+                // We use vkGetQueryResults to copy the results into a host visible buffer
+                vkGetQueryPoolResults(
+                        device,
+                        queryPool,
+                        0,
+                        1,
+                        sizeof(pipelineStats),
+                        pipelineStats,
+                        sizeof(uint64_t),
+                        VK_QUERY_RESULT_64_BIT);
+        }
 
 	// Create a frame buffer attachment
 	void createAttachment(
@@ -308,10 +372,10 @@ public:
 			&offScreenFrameBuf.depth);
 
 		// Set up separate renderpass with references to the color and depth attachments
-		std::array<VkAttachmentDescription, 4> attachmentDescs = {};
+		std::array<VkAttachmentDescription, NUM_MRT> attachmentDescs = {};
 
 		// Init attachment properties
-		for (uint32_t i = 0; i < 4; ++i)
+		for (uint32_t i = 0; i < NUM_MRT; ++i)
 		{
 			attachmentDescs[i].samples = VK_SAMPLE_COUNT_1_BIT;
 			attachmentDescs[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -332,14 +396,18 @@ public:
 
 		// Formats
 		attachmentDescs[0].format = offScreenFrameBuf.position.format;
-		attachmentDescs[1].format = offScreenFrameBuf.normal.format;
-		attachmentDescs[2].format = offScreenFrameBuf.albedo.format;
-		attachmentDescs[3].format = offScreenFrameBuf.depth.format;
+		if (NUM_MRT > 1)
+			attachmentDescs[1].format = offScreenFrameBuf.normal.format;
+		if (NUM_MRT > 2)
+			attachmentDescs[2].format = offScreenFrameBuf.albedo.format;
+//		attachmentDescs[3].format = offScreenFrameBuf.depth.format;
 
 		std::vector<VkAttachmentReference> colorReferences;
 		colorReferences.push_back({ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
-		colorReferences.push_back({ 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
-		colorReferences.push_back({ 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
+		if (NUM_MRT > 1)
+			colorReferences.push_back({ 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
+		if (NUM_MRT > 2)
+			colorReferences.push_back({ 2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL });
 
 		VkAttachmentReference depthReference = {};
 		depthReference.attachment = 3;
@@ -349,7 +417,7 @@ public:
 		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 		subpass.pColorAttachments = colorReferences.data();
 		subpass.colorAttachmentCount = static_cast<uint32_t>(colorReferences.size());
-		subpass.pDepthStencilAttachment = &depthReference;
+		subpass.pDepthStencilAttachment = NULL;//&depthReference;
 
 		// Use subpass dependencies for attachment layput transitions
 		std::array<VkSubpassDependency, 2> dependencies;
@@ -381,11 +449,13 @@ public:
 	
 		VK_CHECK_RESULT(vkCreateRenderPass(device, &renderPassInfo, nullptr, &offScreenFrameBuf.renderPass));
 	
-		std::array<VkImageView,4> attachments;
+		std::array<VkImageView,NUM_MRT> attachments;
 		attachments[0] = offScreenFrameBuf.position.view;
-		attachments[1] = offScreenFrameBuf.normal.view;
-		attachments[2] = offScreenFrameBuf.albedo.view;
-		attachments[3] = offScreenFrameBuf.depth.view;
+		if (NUM_MRT > 1)
+			attachments[1] = offScreenFrameBuf.normal.view;
+		if (NUM_MRT > 2)
+			attachments[2] = offScreenFrameBuf.albedo.view;
+//		attachments[3] = offScreenFrameBuf.depth.view;
 
 		VkFramebufferCreateInfo fbufCreateInfo = {};
 		fbufCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -429,11 +499,13 @@ public:
 		VkCommandBufferBeginInfo cmdBufInfo = vks::initializers::commandBufferBeginInfo();
 
 		// Clear values for all attachments written in the fragment sahder
-		std::array<VkClearValue,4> clearValues;
+		std::array<VkClearValue,NUM_MRT> clearValues;
 		clearValues[0].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-		clearValues[1].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-		clearValues[2].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-		clearValues[3].depthStencil = { 1.0f, 0 };
+		if (NUM_MRT > 1)
+			clearValues[1].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+		if (NUM_MRT > 2)
+			clearValues[2].color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+//		clearValues[3].depthStencil = { 1.0f, 0 };
 
 		VkRenderPassBeginInfo renderPassBeginInfo = vks::initializers::renderPassBeginInfo();
 		renderPassBeginInfo.renderPass =  offScreenFrameBuf.renderPass;
@@ -445,6 +517,7 @@ public:
 
 		VK_CHECK_RESULT(vkBeginCommandBuffer(offScreenCmdBuffer, &cmdBufInfo));
 
+//		vkCmdResetQueryPool(offScreenCmdBuffer, queryPool, 0, 2);
 		vkCmdBeginRenderPass(offScreenCmdBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
 		VkViewport viewport = vks::initializers::viewport((float)offScreenFrameBuf.width, (float)offScreenFrameBuf.height, 0.0f, 1.0f);
@@ -457,6 +530,7 @@ public:
 
 		VkDeviceSize offsets[1] = { 0 };
 
+//		vkCmdBeginQuery(offScreenCmdBuffer, queryPool, 0, VK_QUERY_CONTROL_PRECISE_BIT);
 		// Background
 		vkCmdBindDescriptorSets(offScreenCmdBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayouts.offscreen, 0, 1, &descriptorSets.floor, 0, NULL);
 		vkCmdBindVertexBuffers(offScreenCmdBuffer, VERTEX_BUFFER_BIND_ID, 1, &models.floor.vertices.buffer, offsets);
@@ -468,7 +542,7 @@ public:
 		vkCmdBindVertexBuffers(offScreenCmdBuffer, VERTEX_BUFFER_BIND_ID, 1, &models.model.vertices.buffer, offsets);
 		vkCmdBindIndexBuffer(offScreenCmdBuffer, models.model.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
 		vkCmdDrawIndexed(offScreenCmdBuffer, models.model.indexCount, 3, 0, 0, 0);
-
+//		vkCmdEndQuery(offScreenCmdBuffer, queryPool, 0);
 		vkCmdEndRenderPass(offScreenCmdBuffer);
 
 		VK_CHECK_RESULT(vkEndCommandBuffer(offScreenCmdBuffer));
@@ -545,7 +619,6 @@ public:
 			VK_CHECK_RESULT(vkBeginCommandBuffer(drawCmdBuffers[i], &cmdBufInfo));
 
 			vkCmdBeginRenderPass(drawCmdBuffers[i], &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
-
 			VkViewport viewport = vks::initializers::viewport((float)width, (float)height, 0.0f, 1.0f);
 			vkCmdSetViewport(drawCmdBuffers[i], 0, 1, &viewport);
 
@@ -573,8 +646,7 @@ public:
 			vkCmdBindPipeline(drawCmdBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.deferred);
 			vkCmdBindVertexBuffers(drawCmdBuffers[i], VERTEX_BUFFER_BIND_ID, 1, &models.quad.vertices.buffer, offsets);
 			vkCmdBindIndexBuffer(drawCmdBuffers[i], models.quad.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
-			vkCmdDrawIndexed(drawCmdBuffers[i], 6, 1, 0, 0, 1);
-
+			//			vkCmdDrawIndexed(drawCmdBuffers[i], 6, 1, 0, 0, 1);
 			vkCmdEndRenderPass(drawCmdBuffers[i]);
 
 			VK_CHECK_RESULT(vkEndCommandBuffer(drawCmdBuffers[i]));
@@ -654,7 +726,7 @@ public:
 				VK_VERTEX_INPUT_RATE_VERTEX);
 
 		// Attribute descriptions
-		vertices.attributeDescriptions.resize(5);
+		vertices.attributeDescriptions.resize(2);
 		// Location 0: Position
 		vertices.attributeDescriptions[0] =
 			vks::initializers::vertexInputAttributeDescription(
@@ -662,34 +734,13 @@ public:
 				0,
 				VK_FORMAT_R32G32B32_SFLOAT,
 				0);
-		// Location 1: Texture coordinates
+		// Location 2: Color
 		vertices.attributeDescriptions[1] =
 			vks::initializers::vertexInputAttributeDescription(
 				VERTEX_BUFFER_BIND_ID,
 				1,
-				VK_FORMAT_R32G32_SFLOAT,
-				sizeof(float) * 3);
-		// Location 2: Color
-		vertices.attributeDescriptions[2] =
-			vks::initializers::vertexInputAttributeDescription(
-				VERTEX_BUFFER_BIND_ID,
-				2,
 				VK_FORMAT_R32G32B32_SFLOAT,
 				sizeof(float) * 5);
-		// Location 3: Normal
-		vertices.attributeDescriptions[3] =
-			vks::initializers::vertexInputAttributeDescription(
-				VERTEX_BUFFER_BIND_ID,
-				3,
-				VK_FORMAT_R32G32B32_SFLOAT,
-				sizeof(float) * 8);
-		// Location 4: Tangent
-		vertices.attributeDescriptions[4] =
-			vks::initializers::vertexInputAttributeDescription(
-				VERTEX_BUFFER_BIND_ID,
-				4,
-				VK_FORMAT_R32G32B32_SFLOAT,
-				sizeof(float) * 11);
 
 		vertices.inputState = vks::initializers::pipelineVertexInputStateCreateInfo();
 		vertices.inputState.vertexBindingDescriptionCount = static_cast<uint32_t>(vertices.bindingDescriptions.size());
@@ -912,8 +963,8 @@ public:
 
 		VkPipelineDepthStencilStateCreateInfo depthStencilState =
 			vks::initializers::pipelineDepthStencilStateCreateInfo(
-				VK_TRUE, 
-				VK_TRUE,
+				VK_FALSE, 
+				VK_FALSE,
 				VK_COMPARE_OP_LESS_OR_EQUAL);
 
 		VkPipelineViewportStateCreateInfo viewportState =
@@ -963,9 +1014,9 @@ public:
 
 		// Debug display pipeline
 		pipelineCreateInfo.pVertexInputState = &vertices.inputState;
-		shaderStages[0] = loadShader(getAssetPath() + "shaders/deferred/debug.vert.spv", VK_SHADER_STAGE_VERTEX_BIT);
-		shaderStages[1] = loadShader(getAssetPath() + "shaders/deferred/debug.frag.spv", VK_SHADER_STAGE_FRAGMENT_BIT);
-		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCreateInfo, nullptr, &pipelines.debug));
+//		shaderStages[0] = loadShader(getAssetPath() + "shaders/deferred/debug.vert.spv", VK_SHADER_STAGE_VERTEX_BIT);
+//		shaderStages[1] = loadShader(getAssetPath() + "shaders/deferred/debug.frag.spv", VK_SHADER_STAGE_FRAGMENT_BIT);
+//		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCreateInfo, nullptr, &pipelines.debug));
 		
 		// Offscreen pipeline
 		shaderStages[0] = loadShader(getAssetPath() + "shaders/deferred/mrt.vert.spv", VK_SHADER_STAGE_VERTEX_BIT);
@@ -980,11 +1031,13 @@ public:
 		// Blend attachment states required for all color attachments
 		// This is important, as color write mask will otherwise be 0x0 and you
 		// won't see anything rendered to the attachment
-		std::array<VkPipelineColorBlendAttachmentState, 3> blendAttachmentStates = {
+		std::array<VkPipelineColorBlendAttachmentState, NUM_MRT> blendAttachmentStates = {
 			vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE),
-			vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE),
-			vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE)
 		};
+		if (NUM_MRT > 1)
+			blendAttachmentStates[1] = vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE);
+		if (NUM_MRT > 2)
+			blendAttachmentStates[1] = vks::initializers::pipelineColorBlendAttachmentState(0xf, VK_FALSE);
 
 		colorBlendState.attachmentCount = static_cast<uint32_t>(blendAttachmentStates.size());
 		colorBlendState.pAttachments = blendAttachmentStates.data();
@@ -1132,6 +1185,7 @@ public:
 		submitInfo.pCommandBuffers = &offScreenCmdBuffer;
 		VK_CHECK_RESULT(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE));
 
+//		getQueryResults();
 		// Scene rendering
 
 		// Wait for offscreen semaphore
@@ -1151,6 +1205,7 @@ public:
 		VulkanExampleBase::prepare();
 		loadAssets();
 		generateQuads();
+		setupQueryResultBuffer();
 		setupVertexDescriptions();
 		prepareOffscreenFramebuffer();
 		prepareUniformBuffers();
@@ -1168,12 +1223,12 @@ public:
 		if (!prepared)
 			return;
 		draw();
-		updateUniformBufferDeferredLights();
+//		updateUniformBufferDeferredLights();
 	}
 
 	virtual void viewChanged()
 	{
-		updateUniformBufferDeferredMatrices();
+//		updateUniformBufferDeferredMatrices();
 	}
 
 	void toggleDebugDisplay()
@@ -1202,6 +1257,10 @@ public:
 #else
 		textOverlay->addText("\"F2\" to toggle debug display", 5.0f, 85.0f, VulkanTextOverlay::alignLeft);
 #endif
+		textOverlay->addText("pipeline stats:", width - 5.0f, 5.0f, VulkanTextOverlay::alignRight);
+                textOverlay->addText("VS:" + std::to_string(pipelineStats[0]), width - 5.0f, 20.0f, VulkanTextOverlay::alignRight);
+                textOverlay->addText("FS:" + std::to_string(pipelineStats[1]), width - 5.0f, 35.0f, VulkanTextOverlay::alignRight);
+
 		// Render targets
 		if (debugDisplay)
 		{
